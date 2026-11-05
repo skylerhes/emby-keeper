@@ -6,7 +6,7 @@ on:
     types: [released]
 
 env:
-  REGISTRY_IMAGE: embykeeper/embykeeper
+  REGISTRY_IMAGE: skylerhe/embykeeper
   HF_SPACE_REPO: ekuser/ek
 
 permissions:
