@@ -1,11 +1,11 @@
 """Tests for the bulk run-info fetch (N+1 fix).
 
-回归 2026-11-06: 硬超时（ab85765）把单次缓存调用限制在 1 秒，但
+回归 2026-11-06: 硬超时（ab85765）把单次缓存调用限制在 3 秒，但
 RunContext.list_all 是 N+1 查询——先 find_by_prefix 拿 keys，再对
 每个 key 逐个调 cls.get（即一次 find_one）。py-spy 实测：主线程卡在
 Future.result <- Cache.get <- RunContext.get <- RunContext.list_all，
 工作线程 cache-mongo_0 卡在 SSLSocket.read <- find_one；N 条记录就
-是 N 次 × 每人最多 1 秒，串行累加成几分钟，页面一直转圈。
+是 N 次 × 每人最多 3 秒，串行累加成几分钟，页面一直转圈。
 修复：Cache.find_by_prefix_values 一次 find 取回全部键值，
 list_all 不再逐条调 get。
 """
@@ -102,7 +102,7 @@ class TestListAllBulkQuery(unittest.TestCase):
         self.assertEqual(contexts[0].description, "live")
 
     def test_list_all_returns_quickly_when_bulk_find_blocks(self):
-        """批量 find 卡住时 list_all 在约 1 秒内返回，只含内存任务。"""
+        """批量 find 卡住时 list_all 在约 3 秒内返回，只含内存任务。"""
         release = threading.Event()
 
         def blocked_find(*args, **kwargs):
@@ -123,7 +123,7 @@ class TestListAllBulkQuery(unittest.TestCase):
             finally:
                 release.set()
 
-        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertLess(time.monotonic() - start, 4.5)
         self.assertEqual(collection.find.call_count, 1)
         self.assertEqual(contexts, [live])
 
@@ -166,7 +166,7 @@ class TestFindByPrefixValues(unittest.TestCase):
         self.assertEqual(collection.find_one.call_count, 0)
 
     def test_mongo_returns_empty_dict_when_find_blocks(self):
-        """find 卡住时 find_by_prefix_values 在约 1 秒后返回 {}。"""
+        """find 卡住时 find_by_prefix_values 在约 3 秒后返回 {}。"""
         release = threading.Event()
 
         def blocked_find(*args, **kwargs):
@@ -181,7 +181,7 @@ class TestFindByPrefixValues(unittest.TestCase):
             self.assertEqual(cache.find_by_prefix_values("runinfo."), {})
         finally:
             release.set()
-        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertLess(time.monotonic() - start, 4.5)
 
     def test_mongo_returns_empty_dict_when_find_raises(self):
         """find 抛错时 find_by_prefix_values 返回 {}，不抛错。"""
