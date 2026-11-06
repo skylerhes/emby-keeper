@@ -179,9 +179,12 @@ def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
 
 
 def _account_run_history(
-    account: EmbyAccount, limit: int = EMBY_ACCOUNT_RUN_HISTORY_LIMIT
+    account: EmbyAccount,
+    limit: int = EMBY_ACCOUNT_RUN_HISTORY_LIMIT,
+    contexts: Optional[List[RunContext]] = None,
 ) -> List[Dict[str, Any]]:
-    contexts = [ctx for ctx in RunContext.list_all() if _match_account_run(ctx, account)]
+    all_contexts = contexts if contexts is not None else RunContext.list_all()
+    contexts = [ctx for ctx in all_contexts if _match_account_run(ctx, account)]
     contexts.sort(key=lambda ctx: _sort_datetime(ctx.end_time or ctx.start_time), reverse=True)
     return [_serialize_run_summary(ctx) for ctx in contexts[:limit]]
 
@@ -229,7 +232,9 @@ def _record_account_watch_result(account: EmbyAccount, success: bool, run_time: 
     cache.set(_account_history_cache_key(account), history[:EMBY_ACCOUNT_HISTORY_LIMIT])
 
 
-def _hydrate_account_history_from_runinfo(account: EmbyAccount) -> List[Dict[str, str]]:
+def _hydrate_account_history_from_runinfo(
+    account: EmbyAccount, contexts: Optional[List[RunContext]] = None
+) -> List[Dict[str, str]]:
     history = _read_account_history(account)
     if len(history) >= EMBY_ACCOUNT_HISTORY_LIMIT:
         return history
@@ -238,8 +243,9 @@ def _hydrate_account_history_from_runinfo(account: EmbyAccount) -> List[Dict[str
     collected = list(history)
     seen_times = {record["time"] for record in collected}
 
+    all_contexts = contexts if contexts is not None else RunContext.list_all()
     contexts = sorted(
-        RunContext.list_all(),
+        all_contexts,
         key=lambda ctx: _sort_datetime(ctx.end_time or ctx.start_time),
         reverse=True,
     )
@@ -288,8 +294,12 @@ def _hydrate_account_history_from_runinfo(account: EmbyAccount) -> List[Dict[str
     return trimmed
 
 
-def _serialize_account(account: EmbyAccount) -> Dict[str, Any]:
-    watch_history = _hydrate_account_history_from_runinfo(account)
+def _serialize_account(
+    account: EmbyAccount, contexts: Optional[List[RunContext]] = None
+) -> Dict[str, Any]:
+    if contexts is None:
+        contexts = RunContext.list_all()
+    watch_history = _hydrate_account_history_from_runinfo(account, contexts)
     return {
         "id": _account_key(account),
         "url": str(account.url),
@@ -310,7 +320,7 @@ def _serialize_account(account: EmbyAccount) -> Dict[str, Any]:
         "watch_history": watch_history,
         "hostname": _hostname_from_url(str(account.url)),
         "device_cache": _read_cached_device(account),
-        "run_history": _account_run_history(account),
+        "run_history": _account_run_history(account, contexts=contexts),
     }
 
 
@@ -377,8 +387,11 @@ async def list_emby_accounts(_: bool = Depends(require_auth)):
                 str(cfg.emby.interval_days) if cfg.emby and cfg.emby.interval_days is not None else None
             ),
         }
+        # 运行记录只读一次传给各账号: 每个账号各读一次的话, 缓存出问题时
+        # 延迟会按账号数叠加 (之前每个账号都要等一次 MongoDB 超时)。
+        contexts = RunContext.list_all()
         for a in accounts:
-            status = _serialize_account(a)
+            status = _serialize_account(a, contexts)
             items.append(status)
             if status["enabled"]:
                 summary["enabled"] += 1
@@ -470,7 +483,7 @@ async def start_emby_account_test_run(
 
         run_id = None
         for _ in range(30):
-            for ctx in RunContext.list_all():
+            for ctx in RunContext.list_running():
                 if ctx.id not in existing_ids and ctx.description == description:
                     run_id = ctx.id
                     break
@@ -518,7 +531,7 @@ async def start_emby_account_keepalive(
         existing_ids = {ctx.id for ctx in RunContext.list_all()}
         run_id = None
         for _ in range(30):
-            for ctx in RunContext.list_all():
+            for ctx in RunContext.list_running():
                 if ctx.id not in existing_ids and ctx.description == description:
                     run_id = ctx.id
                     break

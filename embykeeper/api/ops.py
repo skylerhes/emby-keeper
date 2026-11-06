@@ -468,7 +468,8 @@ async def get_ops_overview(
 
             if status is None and is_today:
                 # Fall back to last known result if nothing happened today yet.
-                last_status, last_time = _get_last_checkin_status(account.phone)
+                # 复用本接口开头一次取回的 all_contexts, 不要逐账号再调 list_all。
+                last_status, last_time = _get_last_checkin_status(account.phone, all_contexts)
                 if last_status and last_time:
                     last_dt = datetime.fromisoformat(last_time)
                     if last_dt.tzinfo is None:

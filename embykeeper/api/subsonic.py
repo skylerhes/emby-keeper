@@ -61,7 +61,11 @@ def _read_account_history(account: SubsonicAccount) -> List[Dict[str, str]]:
     return records[:SUBSONIC_ACCOUNT_HISTORY_LIMIT]
 
 
-def _serialize_account(account: SubsonicAccount) -> Dict[str, Any]:
+def _serialize_account(
+    account: SubsonicAccount, contexts: Optional[List[RunContext]] = None
+) -> Dict[str, Any]:
+    if contexts is None:
+        contexts = RunContext.list_all()
     watch_history = _read_account_history(account)
     return {
         "id": _account_key(account),
@@ -74,7 +78,7 @@ def _serialize_account(account: SubsonicAccount) -> Dict[str, Any]:
         "interval_days": str(account.interval_days) if account.interval_days is not None else None,
         "time_range": account.time_range,
         "watch_history": watch_history,
-        "run_history": _account_run_history(account),
+        "run_history": _account_run_history(account, contexts=contexts),
     }
 
 
@@ -150,9 +154,12 @@ def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
 
 
 def _account_run_history(
-    account: SubsonicAccount, limit: int = SUBSONIC_ACCOUNT_RUN_HISTORY_LIMIT
+    account: SubsonicAccount,
+    limit: int = SUBSONIC_ACCOUNT_RUN_HISTORY_LIMIT,
+    contexts: Optional[List[RunContext]] = None,
 ) -> List[Dict[str, Any]]:
-    contexts = [ctx for ctx in RunContext.list_all() if _match_account_run(ctx, account)]
+    all_contexts = contexts if contexts is not None else RunContext.list_all()
+    contexts = [ctx for ctx in all_contexts if _match_account_run(ctx, account)]
     contexts.sort(key=lambda ctx: _sort_datetime(ctx.end_time or ctx.start_time), reverse=True)
     return [_serialize_run_summary(ctx) for ctx in contexts[:limit]]
 
@@ -204,7 +211,7 @@ async def start_subsonic_account_test_run(
 
         run_id = None
         for _ in range(30):
-            for ctx in RunContext.list_all():
+            for ctx in RunContext.list_running():
                 if ctx.id not in existing_ids and ctx.description == description:
                     run_id = ctx.id
                     break
@@ -289,8 +296,11 @@ async def list_subsonic_accounts(_: bool = Depends(require_auth)):
                 else None
             ),
         }
+        # 运行记录只读一次传给各账号: 每个账号各读一次的话, 缓存出问题时
+        # 延迟会按账号数叠加 (之前每个账号都要等一次 MongoDB 超时)。
+        contexts = RunContext.list_all()
         for account in accounts:
-            item = _serialize_account(account)
+            item = _serialize_account(account, contexts)
             items.append(item)
             if item["enabled"]:
                 summary["enabled"] += 1

@@ -224,6 +224,14 @@ class RunContext(BaseModel):
 
         return contexts
 
+    @classmethod
+    def list_running(cls) -> List["RunContext"]:
+        # 只返回内存中的运行任务, 不碰缓存: 轮询新任务是否出现时用它,
+        # 避免每次轮询都查一次 MongoDB (每次最多等一个 3 秒硬超时,
+        # 30 次轮询就累加成几十秒)。新任务一创建就在 _running_runs
+        # 里, 跑完才会被移除并写入缓存。
+        return list(_running_runs.values())
+
     def get_parents(self):
         """获取所有父任务"""
         parents = []
