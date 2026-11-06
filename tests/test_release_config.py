@@ -173,7 +173,11 @@ class DockerReleaseTests(unittest.TestCase):
 
     def test_both_release_workflows_build_images_with_the_panel(self):
         root = Path(__file__).resolve().parents[1]
-        for filename, target in (("docker.yml", "release"), ("docker-dev.yml", "editable")):
+        # fork 用自己的 Docker Hub 名字推 docker.yml（上游是 embykeeper/embykeeper）。
+        for filename, target, image in (
+            ("docker.yml", "release", "skylerhe/embykeeper"),
+            ("docker-dev.yml", "editable", "embykeeper/embykeeper"),
+        ):
             with self.subTest(workflow=filename):
                 workflow = yaml.safe_load((root / ".github" / "workflows" / filename).read_text())
                 builds = [
@@ -182,7 +186,7 @@ class DockerReleaseTests(unittest.TestCase):
                     if step.get("uses", "").startswith("docker/build-push-action@")
                 ]
                 self.assertTrue(builds)
-                self.assertEqual(workflow["env"]["REGISTRY_IMAGE"], "embykeeper/embykeeper")
+                self.assertEqual(workflow["env"]["REGISTRY_IMAGE"], image)
                 for build in builds:
                     self.assertEqual(build["file"], "./deploy/panel/Dockerfile")
                     self.assertEqual(build["target"], target)

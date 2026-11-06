@@ -83,8 +83,10 @@ def _account_from_payload(
     return TelegramAccount(**data)
 
 
-def _serialize_account(account: TelegramAccount) -> Dict[str, Any]:
-    last_checkin_status, last_checkin_time = _get_last_checkin_status(account.phone)
+def _serialize_account(
+    account: TelegramAccount, contexts: Optional[List[RunContext]] = None
+) -> Dict[str, Any]:
+    last_checkin_status, last_checkin_time = _get_last_checkin_status(account.phone, contexts)
     return {
         "phone": account.phone,
         "masked_phone": TelegramAccount.get_phone_masked(account.phone),
@@ -105,12 +107,20 @@ def _serialize_account(account: TelegramAccount) -> Dict[str, Any]:
     }
 
 
-def _get_last_checkin_status(phone: str) -> Tuple[Optional[str], Optional[str]]:
+def _get_last_checkin_status(
+    phone: str, contexts: Optional[List[RunContext]] = None
+) -> Tuple[Optional[str], Optional[str]]:
     latest_status: Optional[str] = None
     latest_time: Optional[datetime] = None
     target_description = f"{phone} 账号签到"
 
-    contexts = [ctx for ctx in RunContext.list_all() if ctx.description == target_description]
+    # 上次签到状态只是展示字段: 缓存不可用时返回未知, 绝不能让账号
+    # 列表/新增接口跟着报错 (曾因 MongoDB 连不上而 30 秒后报 500)。
+    try:
+        all_contexts = contexts if contexts is not None else RunContext.list_all()
+    except Exception:
+        return None, None
+    contexts = [ctx for ctx in all_contexts if ctx.description == target_description]
 
     for ctx in contexts:
         if ctx.status in {RunStatus.PENDING, RunStatus.INITIALIZING, RunStatus.RUNNING, RunStatus.CATAGORY}:
@@ -194,8 +204,11 @@ async def list_telegram_accounts(_: bool = Depends(require_auth)):
                 bool(cfg.registrar.enabled) if cfg.registrar and cfg.registrar.enabled is not None else True
             ),
         }
+        # 运行记录只读一次传给各账号: 每个账号各读一次的话, 缓存出问题时
+        # 延迟会按账号数叠加 (之前每个账号都要等一次 MongoDB 超时)。
+        contexts = RunContext.list_all()
         for a in accounts:
-            status = _serialize_account(a)
+            status = _serialize_account(a, contexts)
             items.append(status)
             if status["enabled"]:
                 summary["enabled"] += 1

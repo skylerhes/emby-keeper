@@ -14,7 +14,15 @@ class Cache:
             try:
                 from pymongo import MongoClient
 
-                self._mongo_client = MongoClient(config.mongodb)
+                # 缓存只是 best-effort: MongoDB 连不上时要快速失败, 不能让
+                # 面板接口卡住 (默认 serverSelectionTimeoutMS 是 30 秒,
+                # 曾导致账号列表接口 30 秒后才报 500, 前端一直转圈)。
+                self._mongo_client = MongoClient(
+                    config.mongodb,
+                    serverSelectionTimeoutMS=3000,
+                    connectTimeoutMS=3000,
+                    socketTimeoutMS=5000,
+                )
                 self._db = self._mongo_client.embykeeper
                 self._collection = self._db.cache
             except ImportError:

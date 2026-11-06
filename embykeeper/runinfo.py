@@ -183,6 +183,10 @@ class RunContext(BaseModel):
 
     @classmethod
     def list_all(cls) -> List["RunContext"]:
+        # 缓存只是运行记录的来源之一, 绝不能让它拖垮调用方: 面板账号列表、
+        # 保活历史等接口都会调这里, MongoDB 连不上时曾导致整个请求 30 秒
+        # 后报 500 (前端一直转圈)。缓存不可用时只返回内存中的运行任务,
+        # 调用方拿不到历史状态也应正常返回, 而不是报错。
         contexts: List[RunContext] = []
         seen_ids = set()
 
@@ -190,7 +194,13 @@ class RunContext(BaseModel):
             contexts.append(ctx)
             seen_ids.add(run_id)
 
-        for key in cache.find_by_prefix("runinfo."):
+        try:
+            keys = cache.find_by_prefix("runinfo.")
+        except Exception as e:
+            logger.warning(f"读取运行记录缓存失败, 仅返回内存中的运行任务: {e}")
+            return contexts
+
+        for key in keys:
             if key.startswith("runinfo.children."):
                 continue
 
@@ -198,7 +208,11 @@ class RunContext(BaseModel):
             if run_id in seen_ids:
                 continue
 
-            ctx = cls.get(run_id)
+            try:
+                ctx = cls.get(run_id)
+            except Exception as e:
+                logger.warning(f"读取运行记录 {run_id} 失败, 已跳过: {e}")
+                continue
             if ctx:
                 contexts.append(ctx)
                 seen_ids.add(run_id)
