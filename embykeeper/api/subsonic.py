@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .auth import require_auth
 from .config import _read_config_dict, _write_config_dict
-from .runinfo import _sort_datetime
+from .runinfo import _index_contexts, _sort_datetime
 from ..cache import cache
 from ..config import config as config_manager
 from ..schema import Config, SubsonicAccount, format_errors
@@ -44,8 +44,13 @@ def _account_history_cache_key(account: SubsonicAccount) -> str:
     return f"subsonic.account_history.{account.url.host}.{account.username}"
 
 
-def _read_account_history(account: SubsonicAccount) -> List[Dict[str, str]]:
-    raw = cache.get(_account_history_cache_key(account), []) or []
+def _read_account_history(
+    account: SubsonicAccount, histories: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, str]]:
+    if histories is not None:
+        raw = histories.get(_account_history_cache_key(account), []) or []
+    else:
+        raw = cache.get(_account_history_cache_key(account), []) or []
     records: List[Dict[str, str]] = []
     if not isinstance(raw, list):
         return records
@@ -62,11 +67,16 @@ def _read_account_history(account: SubsonicAccount) -> List[Dict[str, str]]:
 
 
 def _serialize_account(
-    account: SubsonicAccount, contexts: Optional[List[RunContext]] = None
+    account: SubsonicAccount,
+    contexts: Optional[List[RunContext]] = None,
+    histories: Optional[Dict[str, Any]] = None,
+    child_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     if contexts is None:
         contexts = RunContext.list_all()
-    watch_history = _read_account_history(account)
+    if child_counts is None:
+        _, _, child_counts = _index_contexts(contexts)
+    watch_history = _read_account_history(account, histories)
     return {
         "id": _account_key(account),
         "url": str(account.url),
@@ -78,7 +88,7 @@ def _serialize_account(
         "interval_days": str(account.interval_days) if account.interval_days is not None else None,
         "time_range": account.time_range,
         "watch_history": watch_history,
-        "run_history": _account_run_history(account, contexts=contexts),
+        "run_history": _account_run_history(account, contexts=contexts, child_counts=child_counts),
     }
 
 
@@ -138,7 +148,16 @@ def _match_account_run(ctx: RunContext, account: SubsonicAccount) -> bool:
     return False
 
 
-def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
+def _serialize_run_summary(
+    ctx: RunContext, child_counts: Optional[Dict[str, int]] = None
+) -> Dict[str, Any]:
+    if child_counts is not None:
+        # 列表接口已从取回的 contexts 里按 parent_ids 推算过子任务数，
+        # 这里直接查字典，不再逐条调缓存。
+        child_count = child_counts.get(ctx.id, 0)
+    else:
+        # 单条记录才走这里：只有一次缓存调用，不会累加。
+        child_count = len(cache.get(f"runinfo.children.{ctx.id}", []) or [])
     return {
         "id": ctx.id,
         "description": ctx.description,
@@ -149,7 +168,7 @@ def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
         "start_time": ctx.start_time.isoformat() if ctx.start_time else None,
         "end_time": ctx.end_time.isoformat() if ctx.end_time else None,
         "parent_ids": ctx.parent_ids or [],
-        "child_count": len(cache.get(f"runinfo.children.{ctx.id}", []) or []),
+        "child_count": child_count,
     }
 
 
@@ -157,11 +176,14 @@ def _account_run_history(
     account: SubsonicAccount,
     limit: int = SUBSONIC_ACCOUNT_RUN_HISTORY_LIMIT,
     contexts: Optional[List[RunContext]] = None,
+    child_counts: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     all_contexts = contexts if contexts is not None else RunContext.list_all()
+    if child_counts is None:
+        _, _, child_counts = _index_contexts(all_contexts)
     contexts = [ctx for ctx in all_contexts if _match_account_run(ctx, account)]
     contexts.sort(key=lambda ctx: _sort_datetime(ctx.end_time or ctx.start_time), reverse=True)
-    return [_serialize_run_summary(ctx) for ctx in contexts[:limit]]
+    return [_serialize_run_summary(ctx, child_counts) for ctx in contexts[:limit]]
 
 
 def _find_account_by_key(account_key: str) -> SubsonicAccount:
@@ -298,9 +320,15 @@ async def list_subsonic_accounts(_: bool = Depends(require_auth)):
         }
         # 运行记录只读一次传给各账号: 每个账号各读一次的话, 缓存出问题时
         # 延迟会按账号数叠加 (之前每个账号都要等一次 MongoDB 超时)。
+        # 观看历史也一样：一次批量取回传给各账号，不再每个账号调一次
+        # cache.get；子任务数从取回的 contexts 按 parent_ids 推算。
         contexts = RunContext.list_all()
+        histories = cache.find_by_prefix_values("subsonic.account_history.")
+        _, _, child_counts = _index_contexts(contexts)
         for account in accounts:
-            item = _serialize_account(account, contexts)
+            item = _serialize_account(
+                account, contexts, histories=histories, child_counts=child_counts
+            )
             items.append(item)
             if item["enabled"]:
                 summary["enabled"] += 1

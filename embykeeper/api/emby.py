@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .auth import require_auth
 from .config import _read_config_dict, _write_config_dict
-from .runinfo import _sort_datetime
+from .runinfo import _index_contexts, _sort_datetime
 from ..cache import cache
 from ..schema import Config, EmbyAccount, format_errors
 from ..config import config as config_manager
@@ -112,21 +112,28 @@ def _hostname_from_url(url: str) -> str:
     return url.split("://", 1)[-1].split("/", 1)[0]
 
 
-def _get_cached_site_title(account: EmbyAccount) -> Optional[str]:
-    cached_title = cache.get(_site_title_cache_key(account))
+def _get_cached_site_title(
+    account: EmbyAccount, site_titles: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    if site_titles is not None:
+        cached_title = site_titles.get(_site_title_cache_key(account))
+    else:
+        cached_title = cache.get(_site_title_cache_key(account))
     return cached_title if isinstance(cached_title, str) and cached_title.strip() else None
-
-
-def _card_title(account: EmbyAccount) -> str:
-    return _get_cached_site_title(account) or account.url.host
 
 
 def _card_subtitle(account: EmbyAccount) -> str:
     return account.name or account.username
 
 
-def _read_account_history(account: EmbyAccount) -> List[Dict[str, str]]:
-    return _normalize_history_records(cache.get(_account_history_cache_key(account), []))
+def _read_account_history(
+    account: EmbyAccount, histories: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, str]]:
+    if histories is not None:
+        raw = histories.get(_account_history_cache_key(account), [])
+    else:
+        raw = cache.get(_account_history_cache_key(account), [])
+    return _normalize_history_records(raw)
 
 
 def _account_spec(account: EmbyAccount) -> str:
@@ -163,7 +170,16 @@ def _match_account_run(ctx: RunContext, account: EmbyAccount) -> bool:
     return False
 
 
-def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
+def _serialize_run_summary(
+    ctx: RunContext, child_counts: Optional[Dict[str, int]] = None
+) -> Dict[str, Any]:
+    if child_counts is not None:
+        # 列表接口已从取回的 contexts 里按 parent_ids 推算过子任务数，
+        # 这里直接查字典，不再逐条调缓存。
+        child_count = child_counts.get(ctx.id, 0)
+    else:
+        # 单条记录才走这里：只有一次缓存调用，不会累加。
+        child_count = len(cache.get(f"runinfo.children.{ctx.id}", []) or [])
     return {
         "id": ctx.id,
         "description": ctx.description,
@@ -174,7 +190,7 @@ def _serialize_run_summary(ctx: RunContext) -> Dict[str, Any]:
         "start_time": ctx.start_time.isoformat() if ctx.start_time else None,
         "end_time": ctx.end_time.isoformat() if ctx.end_time else None,
         "parent_ids": ctx.parent_ids or [],
-        "child_count": len(cache.get(f"runinfo.children.{ctx.id}", []) or []),
+        "child_count": child_count,
     }
 
 
@@ -182,15 +198,23 @@ def _account_run_history(
     account: EmbyAccount,
     limit: int = EMBY_ACCOUNT_RUN_HISTORY_LIMIT,
     contexts: Optional[List[RunContext]] = None,
+    child_counts: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     all_contexts = contexts if contexts is not None else RunContext.list_all()
+    if child_counts is None:
+        _, _, child_counts = _index_contexts(all_contexts)
     contexts = [ctx for ctx in all_contexts if _match_account_run(ctx, account)]
     contexts.sort(key=lambda ctx: _sort_datetime(ctx.end_time or ctx.start_time), reverse=True)
-    return [_serialize_run_summary(ctx) for ctx in contexts[:limit]]
+    return [_serialize_run_summary(ctx, child_counts) for ctx in contexts[:limit]]
 
 
-def _read_cached_device(account: EmbyAccount) -> Optional[Dict[str, Any]]:
-    cached = cache.get(_device_cache_key(account), {})
+def _read_cached_device(
+    account: EmbyAccount, devices: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
+    if devices is not None:
+        cached = devices.get(_device_cache_key(account), {})
+    else:
+        cached = cache.get(_device_cache_key(account), {})
     if not isinstance(cached, dict):
         return None
 
@@ -233,9 +257,11 @@ def _record_account_watch_result(account: EmbyAccount, success: bool, run_time: 
 
 
 def _hydrate_account_history_from_runinfo(
-    account: EmbyAccount, contexts: Optional[List[RunContext]] = None
+    account: EmbyAccount,
+    contexts: Optional[List[RunContext]] = None,
+    histories: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
-    history = _read_account_history(account)
+    history = _read_account_history(account, histories)
     if len(history) >= EMBY_ACCOUNT_HISTORY_LIMIT:
         return history
 
@@ -294,19 +320,44 @@ def _hydrate_account_history_from_runinfo(
     return trimmed
 
 
+def _load_account_cache_maps() -> Dict[str, Dict[str, Any]]:
+    """账号列表一次取回三类缓存：站点标题、观看历史、设备信息。
+
+    原先每个账号各调 3 次 cache.get（每人一次 find_one），N 个账号
+    就是 3N 次 MongoDB 查询，串行累加很慢。这里每类键一次批量取回，
+    查询次数与账号数无关。注意不用 "emby." 一个前缀全取——那会连
+    emby.credential.*（登录凭据）一起取回来，没必要也不安全。
+    """
+    return {
+        "site_titles": cache.find_by_prefix_values("emby.site_title."),
+        "histories": cache.find_by_prefix_values("emby.account_history."),
+        "devices": cache.find_by_prefix_values("emby.env."),
+    }
+
+
 def _serialize_account(
-    account: EmbyAccount, contexts: Optional[List[RunContext]] = None
+    account: EmbyAccount,
+    contexts: Optional[List[RunContext]] = None,
+    cache_maps: Optional[Dict[str, Dict[str, Any]]] = None,
+    child_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     if contexts is None:
         contexts = RunContext.list_all()
-    watch_history = _hydrate_account_history_from_runinfo(account, contexts)
+    if child_counts is None:
+        _, _, child_counts = _index_contexts(contexts)
+    maps = cache_maps or {}
+    # 站点标题只取一次，site_title 和 card_title 共用（之前各调一次）。
+    site_title = _get_cached_site_title(account, maps.get("site_titles"))
+    watch_history = _hydrate_account_history_from_runinfo(
+        account, contexts, histories=maps.get("histories")
+    )
     return {
         "id": _account_key(account),
         "url": str(account.url),
         "username": account.username,
         "name": account.name,
-        "site_title": _get_cached_site_title(account),
-        "card_title": _card_title(account),
+        "site_title": site_title,
+        "card_title": site_title or account.url.host,
         "card_subtitle": _card_subtitle(account),
         "enabled": bool(account.enabled),
         "allow_stream": bool(account.allow_stream),
@@ -319,8 +370,8 @@ def _serialize_account(
         "time_range": account.time_range,
         "watch_history": watch_history,
         "hostname": _hostname_from_url(str(account.url)),
-        "device_cache": _read_cached_device(account),
-        "run_history": _account_run_history(account, contexts=contexts),
+        "device_cache": _read_cached_device(account, maps.get("devices")),
+        "run_history": _account_run_history(account, contexts=contexts, child_counts=child_counts),
     }
 
 
@@ -389,9 +440,14 @@ async def list_emby_accounts(_: bool = Depends(require_auth)):
         }
         # 运行记录只读一次传给各账号: 每个账号各读一次的话, 缓存出问题时
         # 延迟会按账号数叠加 (之前每个账号都要等一次 MongoDB 超时)。
+        # 三类账号缓存（站点标题/观看历史/设备信息）也一样：每类键一次
+        # 批量取回传给各账号，不再每个账号各调 3 次 cache.get；子任务数
+        # 从取回的 contexts 按 parent_ids 推算，不再逐条调缓存。
         contexts = RunContext.list_all()
+        cache_maps = _load_account_cache_maps()
+        _, _, child_counts = _index_contexts(contexts)
         for a in accounts:
-            status = _serialize_account(a, contexts)
+            status = _serialize_account(a, contexts, cache_maps=cache_maps, child_counts=child_counts)
             items.append(status)
             if status["enabled"]:
                 summary["enabled"] += 1
