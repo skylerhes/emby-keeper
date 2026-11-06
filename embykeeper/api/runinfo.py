@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 from pathlib import Path
 
 import asyncio
@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from ..cache import cache
-from ..runinfo import RunContext, RunStatus, _running_runs
+from ..runinfo import RunContext, RunStatus
 
 router = APIRouter()
 
@@ -128,8 +128,32 @@ def _context_matches_filters(
     return True
 
 
-def _context_to_dict(ctx: RunContext) -> dict:
-    child_ids = cache.get(f"runinfo.children.{ctx.id}", []) or []
+def _index_contexts(contexts: List[RunContext]):
+    """给一次取回的上下文建索引：按 id、按父任务查子任务、子任务数。
+
+    子任务关系直接从各任务的 parent_ids 推算，不再逐任务查缓存：
+    prepare() 建子任务时同时写 parent_ids 和缓存里的 children 列表，
+    两边是一致的；这里只用已取回的列表，列表接口就只有一次批量查询，
+    超时时也最多等一个 3 秒硬超时。
+    """
+    by_id: Dict[str, RunContext] = {}
+    children: Dict[str, List[RunContext]] = {}
+    child_counts: Dict[str, int] = {}
+    for ctx in contexts:
+        by_id[ctx.id] = ctx
+        for pid in (ctx.parent_ids or []):
+            children.setdefault(pid, []).append(ctx)
+            child_counts[pid] = child_counts.get(pid, 0) + 1
+    return by_id, children, child_counts
+
+
+def _context_to_dict(ctx: RunContext, child_counts: Optional[Dict[str, int]] = None) -> dict:
+    if child_counts is not None:
+        child_count = child_counts.get(ctx.id, 0)
+    else:
+        # 单条记录接口才走这里：只有一次缓存调用，不会累加。
+        child_ids = cache.get(f"runinfo.children.{ctx.id}", []) or []
+        child_count = len(child_ids)
     return {
         "id": ctx.id,
         "parent_ids": ctx.parent_ids or [],
@@ -144,7 +168,7 @@ def _context_to_dict(ctx: RunContext) -> dict:
         "reschedule": ctx.reschedule,
         "has_next_time": ctx.next_time is not None,
         "is_reschedule": _is_reschedule(ctx),
-        "child_count": len(child_ids),
+        "child_count": child_count,
     }
 
 
@@ -165,23 +189,10 @@ def _context_log_items(ctx: RunContext) -> List[dict]:
     return items
 
 
-def _all_run_ids() -> Set[str]:
-    ids: Set[str] = set()
-    keys = cache.find_by_prefix("runinfo.")
-    for key in keys:
-        if not key.startswith("runinfo.children."):
-            ids.add(key.replace("runinfo.", ""))
-    ids.update(list(_running_runs.keys()))
-    return ids
-
-
 def _all_contexts() -> List[RunContext]:
-    contexts: List[RunContext] = []
-    for rid in _all_run_ids():
-        ctx = RunContext.get(rid)
-        if ctx:
-            contexts.append(ctx)
-    return contexts
+    # 直接用已批量取回的 list_all()：一次 find 拿全部记录（最多等一个
+    # 3 秒硬超时），不要再 find_by_prefix 拿 keys 再逐个 RunContext.get。
+    return RunContext.list_all()
 
 
 @router.get("/runinfo")
@@ -198,11 +209,12 @@ async def list_top_level_runs(
 ):
     try:
         statuses = _parse_status_filter(status)
-        contexts: List[RunContext] = []
-        for rid in _all_run_ids():
-            ctx = RunContext.get(rid)
-            if ctx and (not ctx.parent_ids):
-                contexts.append(ctx)
+        # 一次批量取回全部上下文再过滤，不要再逐 id 调 RunContext.get。
+        # 子任务数按全量列表建索引：子任务本身不是顶层任务，过滤后再建
+        # 索引会把 child_count 全算成 0。
+        all_contexts = RunContext.list_all()
+        _, _, child_counts = _index_contexts(all_contexts)
+        contexts = [ctx for ctx in all_contexts if not ctx.parent_ids]
 
         filtered = [
             ctx
@@ -222,7 +234,7 @@ async def list_top_level_runs(
         ]
 
         filtered.sort(key=lambda c: _sort_datetime(c.start_time), reverse=True)
-        return {"runs": [_context_to_dict(c) for c in filtered]}
+        return {"runs": [_context_to_dict(c, child_counts) for c in filtered]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list top-level runs: {e}")
 
@@ -230,14 +242,12 @@ async def list_top_level_runs(
 @router.get("/runinfo/running")
 async def list_running_tasks():
     try:
+        # 只读内存的 list_running()，不碰缓存：运行中的任务从 prepare()
+        # 起就在 _running_runs 里，finish() 时才移除并写入缓存；缓存里
+        # 残留的 RUNNING 记录只能是进程中途死掉的旧数据，不应再报成运行中。
         running = []
-        keys = cache.find_by_prefix("runinfo.")
-        for key in keys:
-            if key.startswith("runinfo.children."):
-                continue
-            rid = key.replace("runinfo.", "")
-            ctx = RunContext.get(rid)
-            if ctx and ctx.status in [RunStatus.PENDING, RunStatus.INITIALIZING, RunStatus.RUNNING]:
+        for ctx in RunContext.list_running():
+            if ctx.status in [RunStatus.PENDING, RunStatus.INITIALIZING, RunStatus.RUNNING]:
                 running.append(
                     {
                         "id": ctx.id,
@@ -260,25 +270,19 @@ async def get_logs(
 ):
     try:
         logs: List[dict] = []
-        run_ids: List[str] = []
-        keys = cache.find_by_prefix("runinfo.")
-        for key in keys:
-            if not key.startswith("runinfo.children."):
-                run_ids.append(key.replace("runinfo.", ""))
-
-        runs: List[RunContext] = []
-        for rid in run_ids[-limit:]:
-            ctx = RunContext.get(rid)
-            if ctx:
-                runs.append(ctx)
-
-        runs.sort(key=lambda x: _sort_datetime(x.start_time), reverse=True)
+        # 一次批量取回全部上下文，按开始时间倒序取最近 limit 条——以前是
+        # 先 find_by_prefix 拿 keys 再逐个 get，key 的顺序本身是任意的，
+        # 取“最后 limit 个 key”再按时间排并不能保证拿到最近的记录。
+        contexts = RunContext.list_all()
+        contexts.sort(key=lambda x: _sort_datetime(x.start_time), reverse=True)
+        runs = contexts[:limit]
+        _, children_by_parent, _ = _index_contexts(contexts)
 
         seen_log_keys: Set[tuple] = set()
-        for run in runs[:limit]:
+        for run in runs:
             log_contexts = [run]
             if include_children:
-                log_contexts.extend(run.get_children())
+                log_contexts.extend(children_by_parent.get(run.id, []))
 
             for log_ctx in log_contexts:
                 for item in _context_log_items(log_ctx):
@@ -309,13 +313,51 @@ async def get_logs(
         raise HTTPException(status_code=500, detail=f"Failed to get logs: {e}")
 
 
+# 注意：固定路径的 /runinfo/summary 必须在 /runinfo/{run_id} 之前注册，
+# 否则 "summary" 会被当成 run_id 吃掉，汇总接口永远 404（原版 bug）。
+@router.get("/runinfo/summary")
+async def get_run_summary():
+    try:
+        all_contexts = _all_contexts()
+        top_level_runs = [ctx for ctx in all_contexts if not ctx.parent_ids]
+        top_level_runs.sort(key=lambda ctx: _sort_datetime(ctx.start_time), reverse=True)
+        _, _, child_counts = _index_contexts(all_contexts)
+
+        summary = {
+            "total": len(top_level_runs),
+            "running": 0,
+            "success": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "recent": [],
+        }
+
+        for ctx in top_level_runs:
+            status_name = ctx.status.name if ctx.status else "UNKNOWN"
+            if status_name in {"PENDING", "INITIALIZING", "RUNNING"}:
+                summary["running"] += 1
+            elif status_name == "SUCCESS":
+                summary["success"] += 1
+            elif status_name == "CANCELLED":
+                summary["cancelled"] += 1
+            else:
+                summary["failed"] += 1
+
+        summary["recent"] = [_context_to_dict(ctx, child_counts) for ctx in top_level_runs[:10]]
+        return summary
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get run summary: {e}")
+
+
 @router.get("/runinfo/{run_id}")
 async def get_run(run_id: str):
     try:
-        ctx = RunContext.get(run_id)
+        # 单条记录也从一次批量取回里查，不要再 find_one + 再查 children。
+        by_id, _, child_counts = _index_contexts(RunContext.list_all())
+        ctx = by_id.get(run_id)
         if not ctx:
             raise HTTPException(status_code=404, detail="Run not found")
-        return {"run": _context_to_dict(ctx)}
+        return {"run": _context_to_dict(ctx, child_counts)}
     except HTTPException:
         raise
     except Exception as e:
@@ -336,13 +378,11 @@ async def list_children_runs(
     is_reschedule: Optional[bool] = None,
 ):
     try:
-        child_ids: List[str] = cache.get(f"runinfo.children.{parent_id}", []) or []
-        # include running children that may not be saved yet (ids already tracked via children list)
-        contexts: List[RunContext] = []
-        for rid in child_ids:
-            ctx = RunContext.get(rid)
-            if ctx:
-                contexts.append(ctx)
+        # 子任务直接从一次批量取回的上下文里按 parent_ids 找，不再查缓存。
+        # 运行中的子任务也在 list_all() 的内存部分里，不会漏掉。
+        contexts = RunContext.list_all()
+        _, children_by_parent, child_counts = _index_contexts(contexts)
+        contexts = children_by_parent.get(parent_id, [])
 
         statuses = _parse_status_filter(status)
         filtered = [
@@ -363,7 +403,7 @@ async def list_children_runs(
         ]
 
         filtered.sort(key=lambda c: _sort_datetime(c.start_time), reverse=True)
-        return {"runs": [_context_to_dict(c) for c in filtered]}
+        return {"runs": [_context_to_dict(c, child_counts) for c in filtered]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list children runs: {e}")
 
@@ -405,48 +445,19 @@ async def stream_logs(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-@router.get("/runinfo/summary")
-async def get_run_summary():
-    try:
-        top_level_runs = [ctx for ctx in _all_contexts() if not ctx.parent_ids]
-        top_level_runs.sort(key=lambda ctx: _sort_datetime(ctx.start_time), reverse=True)
-
-        summary = {
-            "total": len(top_level_runs),
-            "running": 0,
-            "success": 0,
-            "failed": 0,
-            "cancelled": 0,
-            "recent": [],
-        }
-
-        for ctx in top_level_runs:
-            status_name = ctx.status.name if ctx.status else "UNKNOWN"
-            if status_name in {"PENDING", "INITIALIZING", "RUNNING"}:
-                summary["running"] += 1
-            elif status_name == "SUCCESS":
-                summary["success"] += 1
-            elif status_name == "CANCELLED":
-                summary["cancelled"] += 1
-            else:
-                summary["failed"] += 1
-
-        summary["recent"] = [_context_to_dict(ctx) for ctx in top_level_runs[:10]]
-        return summary
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get run summary: {e}")
-
-
 @router.get("/runinfo/{run_id}/logs")
 async def get_run_logs(run_id: str, include_children: bool = True, limit: Optional[int] = None):
     try:
-        ctx = RunContext.get(run_id)
+        # 先一次批量取回再按 id 查，单条记录也不再单独 find_one。
+        by_id, children_by_parent, _ = _index_contexts(RunContext.list_all())
+        ctx = by_id.get(run_id)
         if not ctx:
             raise HTTPException(status_code=404, detail="Run not found")
         items: List[dict] = []
+        # 子任务从已取回的上下文里按 parent_ids 找，不要再逐个 get。
         log_contexts = [ctx]
         if include_children:
-            log_contexts.extend(ctx.get_children())
+            log_contexts.extend(children_by_parent.get(ctx.id, []))
 
         for log_ctx in log_contexts:
             items.extend(_context_log_items(log_ctx))
@@ -463,11 +474,14 @@ async def get_run_logs(run_id: str, include_children: bool = True, limit: Option
 @router.get("/runinfo/{run_id}/parents")
 async def list_parents(run_id: str):
     try:
-        ctx = RunContext.get(run_id)
+        # 先一次批量取回再按 id 查，单条记录也不再单独 find_one。
+        by_id, _, child_counts = _index_contexts(RunContext.list_all())
+        ctx = by_id.get(run_id)
         if not ctx:
             raise HTTPException(status_code=404, detail="Run not found")
-        parents = ctx.get_parents()
-        return {"runs": [_context_to_dict(p) for p in parents]}
+        # 父任务从已取回的上下文里按 id 查，不要再逐个 RunContext.get。
+        parents = [by_id[pid] for pid in (ctx.parent_ids or []) if pid in by_id]
+        return {"runs": [_context_to_dict(p, child_counts) for p in parents]}
     except HTTPException:
         raise
     except Exception as e:
