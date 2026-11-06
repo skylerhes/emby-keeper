@@ -5,7 +5,7 @@
 -> SSLSocket.read（list_telegram_accounts -> RunContext.list_all ->
 RunContext.get），事件循环冻住，所有面板页面一直转圈。pymongo 的
 socket 超时在回包极慢的连接上并不可靠，所以缓存操作改在工作线程
-里跑，调用方最多等 1 秒；卡住的 socket 读留在工作线程里，缓存
+里跑，调用方最多等 3 秒；卡住的 socket 读留在工作线程里，缓存
 是 best-effort，超时/失败时返回默认值。
 """
 
@@ -45,7 +45,7 @@ def _json_cache(tmp_path):
 
 class TestMongoTimeout(unittest.TestCase):
     def test_get_returns_default_when_find_one_blocks(self):
-        """find_one 卡住时 get 在约 1 秒后返回 default，不阻塞调用方。"""
+        """find_one 卡住时 get 在约 3 秒后返回 default，不阻塞调用方。"""
         release = threading.Event()
 
         def blocked_find_one(query):
@@ -60,10 +60,10 @@ class TestMongoTimeout(unittest.TestCase):
             self.assertEqual(cache.get("runinfo.x", "dflt"), "dflt")
         finally:
             release.set()  # 放行工作线程，避免进程退出时等它
-        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertLess(time.monotonic() - start, 4.5)
 
     def test_find_by_prefix_returns_empty_when_find_blocks(self):
-        """find 卡住时 find_by_prefix 在约 1 秒后返回 []。"""
+        """find 卡住时 find_by_prefix 在约 3 秒后返回 []。"""
         release = threading.Event()
 
         def blocked_find(*args, **kwargs):
@@ -78,10 +78,10 @@ class TestMongoTimeout(unittest.TestCase):
             self.assertEqual(cache.find_by_prefix("runinfo."), [])
         finally:
             release.set()
-        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertLess(time.monotonic() - start, 4.5)
 
     def test_write_ops_return_quickly_when_mongo_blocks(self):
-        """set/delete/delete_many 卡住时也不阻塞调用方超过约 1 秒。"""
+        """set/delete/delete_many 卡住时也不阻塞调用方超过约 3 秒。"""
         release = threading.Event()
 
         def blocked(*args, **kwargs):
@@ -100,7 +100,7 @@ class TestMongoTimeout(unittest.TestCase):
             cache.delete_many(["a.b"])
         finally:
             release.set()
-        # 三次写操作各最多等 1 秒；顺序执行，这里放宽到 10 秒，
+        # 三次写操作各最多等 3 秒；顺序执行，这里放宽到 10 秒，
         # 关键是每次都不无限等（无硬超时时这里会卡 90 秒）。
         self.assertLess(time.monotonic() - start, 10.0)
 
@@ -190,7 +190,7 @@ class TestJsonPathUnchanged(unittest.TestCase):
 class TestTelegramAccountsEndpointMongoBlocked(unittest.TestCase):
     def test_endpoint_returns_200_when_mongo_blocks(self):
         """端到端回归：缓存 find 卡住时，GET /telegram/accounts 仍在
-        约 1 秒内返回 200，而不是像 2026-11-06 的故障那样一直转圈。
+        约 3 秒内返回 200，而不是像 2026-11-06 的故障那样一直转圈。
         （list_telegram_accounts 只调一次 list_all，即一次批量
         find_by_prefix_values 调用。）"""
         from unittest.mock import patch

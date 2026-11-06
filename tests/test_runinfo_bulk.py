@@ -2,9 +2,9 @@
 
 背景: 任务记录页 (GET /runinfo) 原先是 N+1 查询——先
 cache.find_by_prefix("runinfo.") 拿 keys，再对每个 id 逐个
-RunContext.get（即一次 find_one），每个最多等一个 1 秒硬超时；
+RunContext.get（即一次 find_one），每个最多等一个 3 秒硬超时；
 _context_to_dict 还对每个任务再调一次 cache.get 取子任务数。
-任务一多就是几十次 × 1 秒串行累加，页面几分钟加载不出来；
+任务一多就是几十次 × 3 秒串行累加，页面几分钟加载不出来；
 每次超时还占住一个线程池工作线程（卡在 SSLSocket.read），
 占满 8 个后其它页面也跟着慢/加载不出来。
 修复：列表接口只调一次 RunContext.list_all()（已批量取回），
@@ -146,7 +146,7 @@ class TestListTopLevelRunsBulk(unittest.TestCase):
         self.assertEqual([r["id"] for r in resp.json()["runs"]], ["OKAAAA"])
 
     def test_returns_quickly_when_cache_blocks(self):
-        """缓存卡住时 GET /runinfo 在约 1 秒内返回空列表。"""
+        """缓存卡住时 GET /runinfo 在约 3 秒内返回空列表。"""
         release = threading.Event()
 
         def blocked_find(*args, **kwargs):
@@ -165,7 +165,7 @@ class TestListTopLevelRunsBulk(unittest.TestCase):
                 finally:
                     release.set()
 
-        self.assertLess(time.monotonic() - start, 2.5)
+        self.assertLess(time.monotonic() - start, 4.5)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["runs"], [])
         self.assertEqual(collection.find.call_count, 1)
@@ -225,7 +225,7 @@ class TestListRunningTasksNoCache(unittest.TestCase):
                 finally:
                     release.set()
 
-        # 不碰缓存，应远快于 1 秒硬超时
+        # 不碰缓存，应远快于 3 秒硬超时
         self.assertLess(time.monotonic() - start, 2.0)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["total_tasks"], 1)
