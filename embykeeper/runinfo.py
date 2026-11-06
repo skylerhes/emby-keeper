@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from asyncio import Event
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 import random
@@ -19,6 +19,22 @@ if TYPE_CHECKING:
     from loguru import Logger
 
 _running_runs: Dict[str, RunContext] = {}
+
+# 运行记录只保留最近 7 天: cache 里的 runinfo 从未清理, 已积到上万条
+# (2026-11-06 实测 11317 条), 一次取回全部要 1.86 秒, 数据转圈久。
+# list_all 在取回后把 7 天前的旧记录批量删掉, 以后不再越积越多。
+_RUNINFO_RETENTION_DAYS = 7
+
+
+def _is_stale_run(ctx: "RunContext") -> bool:
+    """运行记录是否早于保留期 (7 天前), 是则应删掉。
+
+    没有 start_time 的记录无法判断新旧, 为安全起见保留。
+    """
+    if ctx.start_time is None:
+        return False
+    start = _normalize_datetime(ctx.start_time)
+    return start < _now() - timedelta(days=_RUNINFO_RETENTION_DAYS)
 
 
 def _now() -> datetime:
@@ -203,6 +219,9 @@ class RunContext(BaseModel):
             logger.warning(f"读取运行记录缓存失败, 仅返回内存中的运行任务: {e}")
             return contexts
 
+        stale_keys: List[str] = []
+        stale_ids: set = set()
+        kept_cached = 0
         for key, run_json in records.items():
             if key.startswith("runinfo.children."):
                 continue
@@ -219,8 +238,39 @@ class RunContext(BaseModel):
             except Exception as e:
                 logger.warning(f"读取运行记录 {run_id} 失败, 已跳过: {e}")
                 continue
+            # 保留策略: 只保留最近 7 天的记录; 旧的删掉且不返回。
+            if _is_stale_run(ctx):
+                stale_keys.append(key)
+                stale_ids.add(run_id)
+                continue
             contexts.append(ctx)
             seen_ids.add(run_id)
+            kept_cached += 1
+
+        # 保留策略: 旧记录的父子关系键 (runinfo.children.{parent_id}) 随
+        # 父记录一起删掉。只删 cache 集合里 runinfo. 前缀的键, 绝不碰
+        # 配置 (配置在另一个集合, 由 MongoConfigSource 管理) 和其它缓存键。
+        for parent_id in stale_ids:
+            children_key = f"runinfo.children.{parent_id}"
+            if children_key in records:
+                stale_keys.append(children_key)
+
+        # 批量删除旧记录, 失败也不影响返回 (下次取回时再试)。
+        # 删前记录要删的数量, 删完记录剩余数量, 方便核对。
+        if stale_keys:
+            logger.info(
+                f"清理过期运行记录: 将删除 {len(stale_keys)} 个键 "
+                f"(运行记录 {len(stale_ids)} 条, 父子关系键 "
+                f"{len(stale_keys) - len(stale_ids)} 个)。"
+            )
+            try:
+                cache.delete_many(stale_keys)
+                logger.info(
+                    f"清理过期运行记录完成: 已删除 {len(stale_keys)} 个键, "
+                    f"本次取回保留 {kept_cached} 条运行记录。"
+                )
+            except Exception as e:
+                logger.warning(f"清理过期运行记录失败, 已跳过: {e}")
 
         return contexts
 
