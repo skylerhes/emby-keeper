@@ -26,28 +26,31 @@ except Exception:  # pragma: no cover - missing backend deps
 @unittest.skipUnless(_BACKEND_AVAILABLE, "backend dependencies not installed")
 class TestListAllCacheFailure(unittest.TestCase):
     def test_list_all_returns_in_memory_runs_when_cache_raises(self):
-        """find_by_prefix 抛错时不抛到调用方, 只返回内存中的运行任务。"""
+        """find_by_prefix_values 抛错时不抛到调用方, 只返回内存中的运行任务。
+        （list_all 自 ab85765 之后的批量改动起走 find_by_prefix_values
+        一次取回全部记录，不再调 find_by_prefix。）"""
         import embykeeper.runinfo as runinfo
         from unittest.mock import MagicMock
 
         # 注意: runinfo.cache 是懒加载代理, 未加载配置时直接碰它会先报
         # "config not loaded", 所以把模块级的 cache 整个换成假对象。
         fake_cache = MagicMock()
-        fake_cache.find_by_prefix.side_effect = RuntimeError("Connection refused")
+        fake_cache.find_by_prefix_values.side_effect = RuntimeError("Connection refused")
         with patch.object(runinfo, "cache", fake_cache):
             self.assertEqual(RunContext.list_all(), [])
 
     def test_list_all_skips_unreadable_run(self):
-        """某条运行记录读不到时跳过它, 而不是让整个列表失败。"""
+        """某条运行记录解析不了时跳过它, 而不是让整个列表失败。
+        （list_all 自批量改动起不再逐条调 RunContext.get，而是直接解析
+        批量取回的记录；这里用一条坏 JSON 模拟读不到的记录。）"""
         import embykeeper.runinfo as runinfo
         from unittest.mock import MagicMock
 
         fake_cache = MagicMock()
-        fake_cache.find_by_prefix.return_value = ["runinfo.deadbeef"]
-        with (
-            patch.object(runinfo, "cache", fake_cache),
-            patch.object(RunContext, "get", side_effect=RuntimeError("Connection refused")),
-        ):
+        fake_cache.find_by_prefix_values.return_value = {
+            "runinfo.deadbeef": "{not-json",
+        }
+        with patch.object(runinfo, "cache", fake_cache):
             self.assertEqual(RunContext.list_all(), [])
 
 
@@ -85,7 +88,7 @@ class TestTelegramAccountsEndpointCacheFailure(unittest.TestCase):
         from unittest.mock import MagicMock
 
         fake_cache = MagicMock()
-        fake_cache.find_by_prefix.side_effect = RuntimeError("Connection refused")
+        fake_cache.find_by_prefix_values.side_effect = RuntimeError("Connection refused")
         with (
             patch.object(telegram_api, "_load_config", return_value=cfg),
             patch.object(runinfo, "cache", fake_cache),

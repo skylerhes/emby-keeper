@@ -187,6 +187,9 @@ class RunContext(BaseModel):
         # 保活历史等接口都会调这里, MongoDB 连不上时曾导致整个请求 30 秒
         # 后报 500 (前端一直转圈)。缓存不可用时只返回内存中的运行任务,
         # 调用方拿不到历史状态也应正常返回, 而不是报错。
+        # 另外不要逐条查: 批量取回全部记录 (一次 find, 最多等一个 3 秒
+        # 硬超时)。以前是 N+1——先 find_by_prefix 拿 keys, 再对每个 key
+        # 逐个 find_one, N 条记录就串行累加成几分钟。
         contexts: List[RunContext] = []
         seen_ids = set()
 
@@ -195,12 +198,12 @@ class RunContext(BaseModel):
             seen_ids.add(run_id)
 
         try:
-            keys = cache.find_by_prefix("runinfo.")
+            records = cache.find_by_prefix_values("runinfo.")
         except Exception as e:
             logger.warning(f"读取运行记录缓存失败, 仅返回内存中的运行任务: {e}")
             return contexts
 
-        for key in keys:
+        for key, run_json in records.items():
             if key.startswith("runinfo.children."):
                 continue
 
@@ -208,14 +211,16 @@ class RunContext(BaseModel):
             if run_id in seen_ids:
                 continue
 
+            if not run_json:
+                continue
+
             try:
-                ctx = cls.get(run_id)
+                ctx = cls.model_validate_json(run_json)
             except Exception as e:
                 logger.warning(f"读取运行记录 {run_id} 失败, 已跳过: {e}")
                 continue
-            if ctx:
-                contexts.append(ctx)
-                seen_ids.add(run_id)
+            contexts.append(ctx)
+            seen_ids.add(run_id)
 
         return contexts
 

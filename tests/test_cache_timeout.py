@@ -191,7 +191,8 @@ class TestTelegramAccountsEndpointMongoBlocked(unittest.TestCase):
     def test_endpoint_returns_200_when_mongo_blocks(self):
         """端到端回归：缓存 find 卡住时，GET /telegram/accounts 仍在
         约 3 秒内返回 200，而不是像 2026-11-06 的故障那样一直转圈。
-        （list_telegram_accounts 只调一次 list_all，即一次 find_by_prefix。）"""
+        （list_telegram_accounts 只调一次 list_all，即一次批量
+        find_by_prefix_values 调用。）"""
         from unittest.mock import patch
 
         from fastapi.testclient import TestClient

@@ -2,7 +2,7 @@ import concurrent.futures
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List
+from typing import Any, Dict, List
 
 from loguru import logger
 
@@ -167,6 +167,44 @@ class Cache:
                 return keys
 
             return get_keys_with_prefix(self._data)
+
+    def find_by_prefix_values(self, prefix: str) -> Dict[str, Any]:
+        """一次取回指定前缀的全部缓存键值。
+
+        批量接口: RunContext.list_all 原先是 N+1 查询——先 find_by_prefix
+        拿 keys, 再对每个 key 逐个 find_one; 缓存每调一次最多等 3 秒,
+        N 条记录就串行累加成几分钟, 面板一直转圈。这里一次 find 取回
+        _id 和 value, 调用方最多等一个 3 秒硬超时。
+        超时或异常时返回 {} (best-effort, 调用方只拿不到历史数据)。
+        """
+        if self._mongo_client:
+            # 游标是惰性的，必须在工作线程里就把 find + 物化 + 组字典
+            # 全做完，否则网络 I/O 会回到调用方线程上做。
+            return _mongo_call(
+                "find_by_prefix_values",
+                lambda: {
+                    doc["_id"]: doc.get("value")
+                    for doc in self._collection.find(
+                        {"_id": {"$regex": f"^{prefix}"}}, {"_id": 1, "value": 1}
+                    )
+                },
+                {},
+            )
+        else:
+
+            def get_values_with_prefix(d, current_path="", values=None):
+                if values is None:
+                    values = {}
+                for k, v in d.items():
+                    path = f"{current_path}.{k}" if current_path else k
+                    if isinstance(v, dict):
+                        get_values_with_prefix(v, path, values)
+                    else:
+                        if path.startswith(prefix):
+                            values[path] = v
+                return values
+
+            return get_values_with_prefix(self._data)
 
     def delete_by_prefix(self, prefix: str) -> None:
         keys = self.find_by_prefix(prefix)
