@@ -14,8 +14,9 @@ from .config import config
 # （2026-11-06 py-spy 实测: 主线程卡在 SSLSocket.read，事件循环冻住，
 # 所有面板页面一直转圈）。所以所有 MongoDB 操作都在工作线程里跑，
 # 调用方最多等 _MONGO_TIMEOUT 秒；卡住的 socket 读留在工作线程里，
-# 不再占用事件循环。缓存只是 best-effort，超时/失败时返回默认值。
-_MONGO_TIMEOUT = 3.0
+# 不再占用事件循环。缓存只是 best-effort，页面没有运行历史也能正常
+# 显示，所以 1 秒内拿不到就直接返回默认值，不再为非关键数据多等。
+_MONGO_TIMEOUT = 1.0
 _mongo_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cache-mongo")
 
 # 同一类缓存失败 60 秒内只记一次日志，避免 MongoDB 挂掉时日志刷屏。
@@ -172,9 +173,9 @@ class Cache:
         """一次取回指定前缀的全部缓存键值。
 
         批量接口: RunContext.list_all 原先是 N+1 查询——先 find_by_prefix
-        拿 keys, 再对每个 key 逐个 find_one; 缓存每调一次最多等 3 秒,
+        拿 keys, 再对每个 key 逐个 find_one; 缓存每调一次最多等 1 秒,
         N 条记录就串行累加成几分钟, 面板一直转圈。这里一次 find 取回
-        _id 和 value, 调用方最多等一个 3 秒硬超时。
+        _id 和 value, 调用方最多等一个 1 秒硬超时。
         超时或异常时返回 {} (best-effort, 调用方只拿不到历史数据)。
         """
         if self._mongo_client:
